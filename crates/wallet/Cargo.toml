@@ -48,6 +48,11 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [[example]]
+name = "descriptor_with_plan"
+path = "examples/descriptor_with_plan.rs"
+required-features = ["compiler"]
+
+[[example]]
 name = "mnemonic_to_descriptors"
 path = "examples/mnemonic_to_descriptors.rs"
 required-features = ["all-keys"]
