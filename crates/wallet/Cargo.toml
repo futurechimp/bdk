@@ -50,7 +50,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 [[example]]
 name = "descriptor_with_plan"
 path = "examples/descriptor_with_plan.rs"
-required-features = ["compiler"]
+required-features = []
 
 [[example]]
 name = "mnemonic_to_descriptors"

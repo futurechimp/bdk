@@ -1,3 +1,4 @@
+#![allow(unused)]
 use std::str::FromStr;
 
 use bdk_wallet::bitcoin::bip32::Xpriv;
@@ -72,50 +73,40 @@ fn main() {
     // * spend `after` the timelock with the `unvault_pk`
     let policy_str = format!("or(pk({emergency_pk}),and(pk({unvault_pk}),after({after})))");
 
-    // Set up the Policy
-    let policy =
-        Concrete::<DefiniteDescriptorKey>::from_str(&policy_str).expect("couldn't create policy");
-
-    // Compile the policy
-    let vault_policy = policy.compile().expect("policy compilation failed");
-    println!("The vault policy is: {}\n", vault_policy);
-
-    // Turn the policy into a `Descriptor`.
-    let vault_descriptor = Descriptor::new_wsh(vault_policy).expect("could not create descriptor");
-    println!("The vault descriptor is: {}\n", vault_descriptor);
-
-    // 2. Deposit sats into the descriptor
-
-    // Descriptors have script pubkeys that you can send funds to using a normal funds
-    // transfer:
-    println!(
-        "Our vault descriptor has a script_pubkey: {}\n",
-        vault_descriptor.script_pubkey()
-    );
+    // Refer to `examples/compiler.rs` for compiling a miniscript descriptor from a policy string.
+    let desc_str = "wsh(or_d(pk(033b4ac89f5d83de29af72d8b99963c4dbd416fa7c8a8aee6b4761f8f85e588f80),and_v(v:pk(02e7c62fd3a65abdc7ff233fba5637f89c9eaba7fe6baaf15ca99d81e0f5145bf8),after(1311208))))#9xvht4sc";
+    println!("The vault descriptor is: {}\n", desc_str);
 
     // Alternately, we can make a wallet for our vault and get its address:
-    let mut vault = Wallet::create_single(vault_descriptor.to_string())
+    let mut vault = Wallet::create_single(desc_str)
         .network(Network::Testnet)
         .create_wallet_no_persist()
         .unwrap();
     let vault_address = vault.peek_address(KeychainKind::External, 0).address;
     println!("The vault address is {:?}", vault_address);
+    let vault_descriptor = vault.public_descriptor(KeychainKind::External).clone();
+    let definite_descriptor = vault_descriptor.at_derivation_index(0).unwrap();
 
     // We don't need to broadcast the funding transaction in this tutorial -
     // having it locally is good enough to get the information we need, and it saves
     // messing around with faucets etc.
 
     // Fund the vault by inserting a transaction:
-    let deposit_tx = deposit_transaction(vault_address);
-    vault.insert_tx(deposit_tx.clone());
+    let witness_utxo = TxOut {
+        value: Amount::from_sat(76_000),
+        script_pubkey: vault_address.script_pubkey(),
+    };
+    let tx = Transaction {
+        output: vec![witness_utxo.clone()],
+        ..blank_transaction()
+    };
 
-    // 3. Get the previous output and witness from the deposit transaction. In a real application
+    let previous_output = deposit_transaction(&mut vault, tx);
+    println!("Vault balance: {}", vault.balance().total());
+
+    // 3. Get the previous output and txout from the deposit transaction. In a real application
     // you would get this from the blockchain if you didn't make the deposit_tx.
-    let (previous_output, witness_utxo) = get_vout(&deposit_tx, &vault_descriptor.script_pubkey());
-    println!(
-        "The deposit transaction's outpoint was  {} \n The deposit transaction's witness utxo was: {:#?} ",
-        previous_output, witness_utxo
-    );
+    println!("The deposit transaction's outpoint was {}", previous_output);
 
     // 4. Set up a psbt to spend the deposited funds
     println!("Setting up a psbt for the emergency spend path");
@@ -168,14 +159,13 @@ fn main() {
     let assets = Assets::new().add(emergency_key_asset);
 
     // Automatically generate a plan for spending the descriptor
-    let emergency_plan = vault_descriptor
+    let emergency_plan = definite_descriptor
         .clone()
         .plan(&assets)
         .expect("couldn't create emergency plan");
 
     // Create an input where we can put the plan data
     // Add the witness_utxo from the deposit transaction to the input
-    println!("Adding deposit transaction's witness output to the emergency spend psbt");
     let mut input = psbt::Input {
         witness_utxo: Some(witness_utxo.clone()),
         ..Default::default()
@@ -215,6 +205,8 @@ fn main() {
     // here as it saves messing around with faucets, wallets, etc.
     let _my_emergency_spend_tx = psbt.extract_tx().expect("failed to extract emergency tx");
 
+    println!("===================================================");
+
     // Let's now try the same thing with the unvault transaction. We just need to make a new
     // plan, sign a new spending psbt, and finalize it.
 
@@ -225,8 +217,7 @@ fn main() {
     let mut psbt = Psbt::from_unsigned_tx(unvault_spend_transaction)
         .expect("couldn't create psbt from unvault_spend_transaction");
 
-    // Format an input containing the previous output (we got that already using `get_vout()`)
-    println!("Adding deposit transaction's witness output to the unvault spend psbt");
+    // Format an input containing the previous output
     let txin = TxIn {
         previous_output,
         sequence: Sequence::ENABLE_RBF_NO_LOCKTIME, // disables relative timelock
@@ -253,7 +244,7 @@ fn main() {
     let unvault_assets = Assets::new().add(unvault_key_asset).after(timelock);
 
     // Automatically generate a plan for spending the descriptor, using the assets in our plan
-    let unvault_plan = vault_descriptor
+    let unvault_plan = definite_descriptor
         .clone()
         .plan(&unvault_assets)
         .expect("couldn't create plan");
@@ -297,24 +288,8 @@ fn main() {
     println!("Read the code comments for a more detailed look at what happened.")
 }
 
-// Find the OutPoint by spk, useful for ensuring that we grab the right
-// output transaction to use as input for our spend transaction
-fn get_vout(tx: &Transaction, spk: &Script) -> (OutPoint, TxOut) {
-    for (i, txout) in tx.clone().output.into_iter().enumerate() {
-        if spk == &txout.script_pubkey {
-            return (OutPoint::new(tx.compute_txid(), i as u32), txout);
-        }
-    }
-    panic!("Only call get vout on functions which have the expected outpoint");
-}
-
 fn blank_transaction() -> bitcoin::Transaction {
-    bitcoin::Transaction {
-        version: transaction::Version::TWO,
-        lock_time: absolute::LockTime::ZERO, // disables relative timelock
-        input: vec![],
-        output: vec![],
-    }
+    blank_transaction_with(absolute::LockTime::ZERO)
 }
 
 fn blank_transaction_with(lock_time: absolute::LockTime) -> bitcoin::Transaction {
@@ -326,22 +301,20 @@ fn blank_transaction_with(lock_time: absolute::LockTime) -> bitcoin::Transaction
     }
 }
 
-fn deposit_transaction(receive_address: Address) -> bitcoin::Transaction {
-    Transaction {
-        version: transaction::Version::ONE,
-        lock_time: bitcoin::absolute::LockTime::ZERO,
-        input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: Txid::all_zeros(),
-                vout: 0,
-            },
-            script_sig: Default::default(),
-            sequence: Default::default(),
-            witness: Default::default(),
-        }],
-        output: vec![TxOut {
-            value: Amount::from_sat(76_000),
-            script_pubkey: receive_address.script_pubkey(),
-        }],
-    }
+fn deposit_transaction(wallet: &mut Wallet, tx: Transaction) -> OutPoint {
+    use bdk_chain::{ConfirmationBlockTime, TxGraph};
+    use bdk_wallet::Update;
+
+    let txid = tx.compute_txid();
+    let vout = 0;
+    let mut graph = TxGraph::<ConfirmationBlockTime>::new([tx]);
+    let _ = graph.insert_seen_at(txid, 42);
+    wallet
+        .apply_update(Update {
+            graph,
+            ..Default::default()
+        })
+        .unwrap();
+
+    OutPoint { txid, vout }
 }
